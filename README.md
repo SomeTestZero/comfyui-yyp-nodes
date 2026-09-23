@@ -8,11 +8,13 @@
 |---|---|---|---|
 | `FreeModelsPassthrough` | Free All Models (Passthrough) | `free_models.py` | 透传任意类型数据，执行时先卸载所有已加载/staged 模型并清缓存。串在"不再需要模型"和"吃内存的无模型节点"（如 Topaz 放大）之间，靠数据依赖保证顺序 |
 | `Sage3AttentionPatch` | SageAttention3 Attention (FP4) | `sage3_attention.py` | 将扩散模型的注意力替换为 SageAttention3（Blackwell FP4）。需要 `sageattn3` 包；masked 或不支持的 shape 自动回退 pytorch attention。未安装时直接报错 |
-| `H3ResolutionSelector` | Resolution Selector (H3 精度版) | `h3_resolution_selector.py` | 按宽高比 + 预设（H3 原生短边 768 / 0.72MP / 0.5MP / 自定义）输出对齐到倍数的 width/height，详见 [RESOLUTION_TABLE.md](RESOLUTION_TABLE.md) |
+| `H3ResolutionPicker` | Resolution Picker (H3 尺寸直选版) | `h3_resolution_selector.py` | 先选宽高比（16:9 / 1:1 / 3:2 …，16:9 置顶），再在该比例的档位里选尺寸，选项形如 `1344x768 (0.98MP)`；组内按像素量从小到大，每组默认满血档；超过官方画布（短边 768 + 面积上限 768×1344）的档位带 `⚠超画布` |
+| `H3ResolutionSelector` | Resolution Selector (H3 精度版) | `h3_resolution_selector.py` | 与 Picker 同一套档位，反过来按像素量选：选项形如 `0.98MP (1344x768)`，超画布的同样带 `⚠超画布`。两者都只有「比例 + 档位」两个下拉，输出 width/height，详见 [RESOLUTION_TABLE.md](RESOLUTION_TABLE.md) |
 
 ## 说明
 
 - 各节点在合并进本包之前曾以散文件形式单独存在，节点 ID 未变，旧工作流可直接兼容。
+- `H3ResolutionPicker` / `H3ResolutionSelector` 用 `io.DynamicCombo`（ComfyUI 原生「选项决定后续输入」机制，同内置 Save Image (Advanced) 的 format），prompt 里嵌套项的键是 `aspect_ratio.resolution`。Selector 旧版的 `preset` / `megapixels` / `multiple` 三个输入已删除，老工作流里的这两个值需要重新在下拉里选一次。
 - `free_models.py` 使用 `comfy_api.latest` 的 io 节点风格（`define_schema` / `execute`），需要较新的 ComfyUI 前端/后端。
 
 ## WebUI 前端补丁
