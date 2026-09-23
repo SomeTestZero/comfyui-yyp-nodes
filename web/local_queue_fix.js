@@ -1,42 +1,44 @@
-// 本地前端补丁（仅非 comfy.org 部署生效）：让"运行"按钮不受 cloud 鉴权拖累。
+// 本地前端补丁（仅非 comfy.org 部署生效）：让"运行"按钮不被挂死的提交卡成哑巴。
 //
-// 前端把"提交任务"和 ComfyUI 账号的工作区鉴权绑在同一条路径上，且这些 await 都没有超时：
-// ComfyApp.queuePrompt 里 `await waitForWorkspaceSwitch()` / `await getWorkspaceAuthToken()`
-// 位于 try/finally 之外 —— cloud 不可达时要么弹"提示执行失败 / 用户未认证"并清空队列，
-// 要么永久挂住把 app.processingQueue 留在 true，之后每次点运行都被开头那句
-// `if (this.processingQueue) return false` 静默吃掉（只能 F5）。本地服务端并不需要 cloud token。
+// ComfyApp.queuePrompt 的提交链上有多个无超时的 await（1.51.10 源码核实）：
+//   - await teamWorkspaceStore.waitForWorkspaceSwitch()  在 try/finally 之外；
+//   - await useAuthStore().getWorkspaceAuthToken()       在 try/finally 之外，且上游连 catch 都没有；
+//   - 本地 POST /prompt 的 fetch 没有超时，服务器忙碌时挂几十秒。
+// 任何一个挂住，app.processingQueue 就停在 true，之后每次点运行都被入口的
+// `if (this.processingQueue) return false` 静默吃掉（点了没反应），只能 F5。
 //
-// 三处拦截：
-//   1. cloud/Firebase 请求加超时，任何 cloud 调用不再无限等待（本地请求不碰）；
-//   2. 工作区 token 拿不到时用占位值放行，本地排队照常提交；
-//   3. 看门狗：单次提交长时间不返回时复位 app.processingQueue，按钮不会变哑巴。
-// 状态：window.__yypLocalQueueFix（stubs = 占位放行次数，watchdogHits = 看门狗触发次数）。
+// 四层拦截：
+//   1. cloud / Firebase 请求 10s 超时；本地 POST /prompt 45s 兜底超时（超时后走
+//      上游 catch 弹"提示执行失败"并复位状态，而不是永远挂住）；
+//   2. 工作区 token 拿不到就占位放行，本地排队照常提交；占位结果缓存 10 分钟，
+//      期间点击不再白等 2.5s；
+//   3. queuePrompt wrap：一次提交发起 20s 仍未结束视为挂死；之后任何一次点击
+//      立即复位状态机并接管本次提交，无需 F5；
+//   4. 兜底看门狗：挂死 25s 后自动复位，即使不再点击。
+// 三个 wrap 都按"方法身份"幂等，pinia store 重建后重新包上。
+// 诊断：window.__yypLocalQueueFix（stubs = 占位放行次数，watchdogHits = 自动复位次数）。
 
 const CLOUD_HOST_RE = /(^|\.)(comfy\.org|googleapis\.com|firebaseapp\.com|googleusercontent\.com)$/i
 const CLOUD_FETCH_TIMEOUT_MS = 10_000 // 单次 cloud / Firebase 请求上限
+const PROMPT_TIMEOUT_MS = 45_000 // 本地 POST /prompt 兜底上限，正常 <2s
 const TOKEN_WAIT_MS = 2_500 // 等真 token 的时长，超时改用占位值
 const SWITCH_WAIT_MS = 2_500 // 等工作区切换的时长
-const STUCK_RESET_MS = 30_000 // 提交卡死多久后复位按钮状态
+const TOKEN_STUB_TTL_MS = 10 * 60_000 // 占位 token 缓存时长
+const STUCK_RESET_MS = 20_000 // 提交多久没结束视为挂死
+const WATCHDOG_MS = STUCK_RESET_MS + 5_000 // 看门狗轮询点（触发时按 STUCK_RESET_MS 判定）
 const LOCAL_TOKEN = 'local-offline' // 占位 token：本地服务端不校验
+const LOCAL_ORIGIN = new URL(location.href).origin
 
 const state = (window.__yypLocalQueueFix = window.__yypLocalQueueFix || {
   installed: false,
   storesPatched: false,
   stubs: 0,
   watchdogHits: 0,
+  lastSubmitAt: 0,
+  tokenStubUntil: 0,
 })
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-
-function isCloudRequest(input) {
-  const raw = typeof input === 'string' ? input : input?.url
-  if (!raw) return false
-  try {
-    return CLOUD_HOST_RE.test(new URL(raw, location.href).hostname)
-  } catch {
-    return false
-  }
-}
 
 function timeoutSignal(ms) {
   if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
@@ -52,8 +54,20 @@ function patchCloudFetch() {
   state.fetchPatched = true
   const nativeFetch = window.fetch.bind(window)
   window.fetch = function (input, init) {
-    if (!isCloudRequest(input) || init?.signal) return nativeFetch(input, init)
-    const bound = timeoutSignal(CLOUD_FETCH_TIMEOUT_MS)
+    if (init?.signal) return nativeFetch(input, init)
+    let url = null
+    try {
+      url = new URL(typeof input === 'string' ? input : input?.url, location.href)
+    } catch {
+      return nativeFetch(input, init)
+    }
+    const isCloud = CLOUD_HOST_RE.test(url.hostname)
+    const isPrompt =
+      url.origin === LOCAL_ORIGIN &&
+      url.pathname === '/prompt' &&
+      (init?.method || 'GET').toUpperCase() === 'POST'
+    if (!isCloud && !isPrompt) return nativeFetch(input, init)
+    const bound = timeoutSignal(isCloud ? CLOUD_FETCH_TIMEOUT_MS : PROMPT_TIMEOUT_MS)
     const call = nativeFetch(input, { ...init, signal: bound.signal })
     return bound.release ? call.finally(bound.release) : call
   }
@@ -78,48 +92,70 @@ function store(name) {
   return pinia?._s?.get(name) ?? null
 }
 
-function patchStores() {
-  if (state.storesPatched) return true
-  const team = store('teamWorkspace')
-  const auth = store('auth')
-  const workspaceAuth = store('workspaceAuth')
+// 工作区 token：先吃缓存；拿不到就限时等 cloud，再不行给占位值让本地排队继续。
+// 占位结果缓存 TOKEN_STUB_TTL_MS，避免每次点击都白等 TOKEN_WAIT_MS。
+function patchToken(auth, workspaceAuth, team) {
   if (typeof auth?.getWorkspaceAuthToken !== 'function') return false
-  if (typeof team?.waitForWorkspaceSwitch !== 'function') return false
-  if (typeof workspaceAuth?.getWorkspaceToken !== 'function') return false
-
-  // 工作区 token：先吃缓存；拿不到就不再等 cloud，给占位值让本地排队继续
+  if (auth.getWorkspaceAuthToken === state._tokenWrap) return true
   const realToken = auth.getWorkspaceAuthToken.bind(auth)
-  auth.getWorkspaceAuthToken = async () => {
+  const wrapped = async () => {
     let cached
     try {
-      cached = workspaceAuth.getWorkspaceToken()
+      cached = workspaceAuth?.getWorkspaceToken()
     } catch {
       cached = undefined
     }
     if (cached) return cached
+    if (state.tokenStubUntil && Date.now() < state.tokenStubUntil) return LOCAL_TOKEN
     let token
     try {
       token = await Promise.race([realToken(), wait(TOKEN_WAIT_MS)])
     } catch {
       token = undefined
     }
-    if (token || !team.activeWorkspaceId) return token
+    if (token || !team?.activeWorkspaceId) return token
     state.stubs += 1
+    state.tokenStubUntil = Date.now() + TOKEN_STUB_TTL_MS
     return LOCAL_TOKEN
   }
+  state._tokenWrap = wrapped
+  auth.getWorkspaceAuthToken = wrapped
+  return true
+}
 
-  // 工作区切换：本地部署不该因为切换失败/超时拖住排队
+// 工作区切换：本地提交不依赖切换结果，限时等待并吞掉错误
+function patchSwitch(team) {
+  if (typeof team?.waitForWorkspaceSwitch !== 'function') return false
+  if (team.waitForWorkspaceSwitch === state._switchWrap) return true
   const realWait = team.waitForWorkspaceSwitch.bind(team)
-  team.waitForWorkspaceSwitch = async () => {
+  const wrapped = async () => {
     try {
       await Promise.race([realWait(), wait(SWITCH_WAIT_MS)])
     } catch {
       // 忽略：本地提交不依赖工作区切换结果
     }
   }
-
-  state.storesPatched = true
+  state._switchWrap = wrapped
+  team.waitForWorkspaceSwitch = wrapped
   return true
+}
+
+function patchStores() {
+  const a = patchToken(store('auth'), store('workspaceAuth'), store('teamWorkspace'))
+  const b = patchSwitch(store('teamWorkspace'))
+  if ((a || b) && !state.storesPatched) {
+    state.storesPatched = true
+    console.info('[yyp-local-queue-fix] stores wrapped: token stub + switch timeout')
+  }
+  return a || b
+}
+
+function resetStuck(reason) {
+  const app = window.app
+  app.processingQueue = false
+  if (Array.isArray(app.queueItems)) app.queueItems.length = 0
+  state.watchdogHits += 1
+  console.warn(`[yyp-local-queue-fix] ${reason}, reset queue state`)
 }
 
 function install(app) {
@@ -129,21 +165,27 @@ function install(app) {
   app.__yypQueueFix = true
   app.queuePrompt = async function (...args) {
     patchStores()
-    let timer
+    const now = Date.now()
+    if (app.processingQueue && (now - state.lastSubmitAt >= STUCK_RESET_MS || !state.lastSubmitAt)) {
+      // 有提交挂着但远超正常耗时：视为挂死，复位后让本次点击立即接管
+      resetStuck(`previous submit stuck for ${state.lastSubmitAt ? Math.round((now - state.lastSubmitAt) / 1000) + 's' : 'unknown time'}`)
+    }
     if (!app.processingQueue) {
-      // 这次调用才真正开始提交：卡住时复位按钮状态并丢掉堆积的点击，不必 F5
-      timer = setTimeout(() => {
-        if (!app.processingQueue) return
-        app.processingQueue = false
-        if (Array.isArray(app.queueItems)) app.queueItems.length = 0
-        state.watchdogHits += 1
-      }, STUCK_RESET_MS)
+      // 本次调用是发起者：记录开始时间并设兜底看门狗
+      state.lastSubmitAt = Date.now()
+      const timer = setTimeout(() => {
+        if (app.processingQueue && Date.now() - state.lastSubmitAt >= STUCK_RESET_MS) {
+          resetStuck('watchdog: submit did not finish')
+        }
+      }, WATCHDOG_MS)
+      try {
+        return await original.apply(app, args)
+      } finally {
+        clearTimeout(timer)
+      }
     }
-    try {
-      return await original.apply(app, args)
-    } finally {
-      clearTimeout(timer)
-    }
+    // 正常单飞窗口内的重复点击：维持上游语义（push 排队或被拒绝）
+    return original.apply(app, args)
   }
   return true
 }
@@ -155,7 +197,7 @@ function bootstrap() {
   if (!install(app)) return false
   if (!state.installed) {
     state.installed = true
-    console.info('[yyp-local-queue-fix] active: cloud fetch timeout + local token fallback + queue watchdog')
+    console.info('[yyp-local-queue-fix] active: fetch timeouts + token stub + stuck-submit takeover')
   }
   return true
 }
@@ -166,6 +208,6 @@ if (!CLOUD_HOST_RE.test(location.hostname)) {
     const poll = setInterval(() => {
       if (bootstrap()) clearInterval(poll)
     }, 300)
-    setTimeout(() => clearInterval(poll), 60_000)
+    setTimeout(() => clearInterval(poll), 300_000)
   }
 }
